@@ -1,192 +1,244 @@
 import os
 import requests
 import google.generativeai as genai
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from dotenv import load_dotenv
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
-# Load .env file for local development
+# Load environment variables
 load_dotenv()
 
+# Gemini AI Configuration
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-3.1-flash-lite")
+
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# --- CONFIGURATION ---
-# Add this to your Vercel Environment Variables. 
-# If not set, it defaults to the string below.
-CRON_SECRET = os.getenv("CRON_SECRET", "my_super_secret_key_123")
+# Buffer Config
+BUFFER_TOKEN = os.getenv("BUFFER_ACCESS_TOKEN")
+BUFFER_PROFILE_ID = os.getenv("BUFFER_PROFILE_ID")
+UNSPLASH_KEY = os.getenv("UNSPLASH_ACCESS_KEY")
 
-# --- HELPERS ---
-def get_env(key):
-    return os.getenv(key)
+class PromptRequest(BaseModel):
+    topic: str
 
-def get_db_connection():
-    url = get_env("DATABASE_URL")
-    if not url: 
-        raise Exception("DATABASE_URL is missing from environment variables")
-    
-    # FIX for Neon/Vercel: psycopg2 requires 'postgres://', but Neon provides 'postgresql://'
-    if url.startswith("postgresql://"):
-        url = url.replace("postgresql://", "postgres://", 1)
-    
-    try:
-        # sslmode='require' is mandatory for Neon DB connections
-        return psycopg2.connect(
-            url, 
-            connect_timeout=10, 
-            sslmode='require' 
-        )
-    except Exception as e:
-        raise Exception(f"Neon Connection Failed: {str(e)}")
+class PostRequest(BaseModel):
+    caption: str
+    image_url: str
 
-# --- DATABASE LOGIC ---
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# --- SEQUENTIAL TOPIC LOGIC ---
+
 def get_sequential_topic():
-    conn = None
+    """Cycles through topics.txt using pointer.txt."""
+    if not os.path.exists("topics.txt"):
+        with open("topics.txt", "w") as f:
+            f.write("resilience\ndiscipline\nfocus\ngrowth\n")
+
+    with open("topics.txt", "r") as f:
+        all_topics = [line.strip() for line in f if line.strip()]
+
+    if os.path.exists("pointer.txt"):
+        with open("pointer.txt", "r") as f:
+            try:
+                current_index = int(f.read().strip())
+            except:
+                current_index = 0
+    else:
+        current_index = 0
+
+    actual_index = current_index % len(all_topics)
+    selected_topic = all_topics[actual_index]
+
+    with open("pointer.txt", "w") as f:
+        f.write(str(actual_index + 1))
+
+    return selected_topic
+
+# --- AI EYE LOGIC ---
+
+def get_image_keywords(caption):
+    """Analyzes the quote to find the best matching image keywords."""
     try:
-        conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        # Create tables if they don't exist (Automatic Setup)
-        cur.execute("CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value INTEGER)")
-        cur.execute("CREATE TABLE IF NOT EXISTS topics (id SERIAL PRIMARY KEY, name TEXT UNIQUE)")
-        cur.execute("INSERT INTO bot_state (key, value) VALUES ('pointer', 0) ON CONFLICT DO NOTHING")
-        
-        # Seed default topics if the table is empty
-        cur.execute("SELECT COUNT(*) as total FROM topics")
-        total = cur.fetchone()['total']
-        
-        if total == 0:
-            topics_list = [('resilience',), ('discipline',), ('focus',), ('growth',), ('mindset',), ('consistency',)]
-            cur.executemany("INSERT INTO topics (name) VALUES (%s)", topics_list)
-            conn.commit()
-            cur.execute("SELECT COUNT(*) as total FROM topics")
-            total = cur.fetchone()['total']
-        
-        # Get the current pointer (where we left off)
-        cur.execute("SELECT value FROM bot_state WHERE key = 'pointer'")
-        res = cur.fetchone()
-        pointer = res['value'] if res else 0
-        
-        # Calculate the actual topic ID (modulo allows looping back to start)
-        actual_id = (pointer % total) + 1
-        
-        cur.execute("SELECT name FROM topics WHERE id = %s", (actual_id,))
-        topic_row = cur.fetchone()
-        
-        if not topic_row:
-            raise Exception(f"Topic with ID {actual_id} not found in database")
-            
-        topic = topic_row['name']
-        
-        # Increment pointer for the next run
-        cur.execute("UPDATE bot_state SET value = value + 1 WHERE key = 'pointer'")
-        conn.commit()
-        
-        cur.close()
-        return topic
-        
-    except Exception as e:
-        raise Exception(f"DB Error: {str(e)}")
-    finally:
-        if conn:
-            conn.close()
+        prompt = f"Based on this quote: '{caption}', provide 3 simple English keywords for a high-quality Unsplash photo search. Return ONLY the keywords separated by commas."
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except:
+        return "motivational, nature"
 
-# --- CONTENT LOGIC ---
-def get_ai_content(topic):
-    api_key = get_env("GEMINI_API_KEY")
-    if not api_key: raise Exception("GEMINI_API_KEY missing")
-    
-    genai.configure(api_key=api_key)
-    # Using gemini-1.5-flash: fast, efficient, and reliable
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    
-    # 1. Generate a high-impact quote
-    caption_res = model.generate_content(f"Write a powerful, short, one-sentence Facebook quote about {topic}. No hashtags.")
-    caption = caption_res.text.strip()
-    
-    # 2. Generate keywords for Unsplash image search
-    kw_prompt = f"Provide 3 simple English keywords for a high-quality Unsplash photo that matches this quote: '{caption}'. Comma separated only."
-    kw_res = model.generate_content(kw_prompt)
-    keywords = kw_res.text.strip()
-    
-    # 3. Fetch random image from Unsplash
-    unsplash_key = get_env("UNSPLASH_ACCESS_KEY")
-    img_url = "https://images.unsplash.com/photo-1497567149193-57567572f26f" # Hardcoded fallback image
-    if unsplash_key:
-        try:
-            res = requests.get(
-                f"https://api.unsplash.com/photos/random?query={keywords}&client_id={unsplash_key}&orientation=squarish", 
-                timeout=10
-            )
-            img_url = res.json().get("urls", {}).get("regular", img_url)
-        except: 
-            pass # Use fallback if Unsplash fails
-            
-    return caption, img_url
+def fetch_unsplash_image(keywords):
+    """Fetches a random image from Unsplash based on AI keywords."""
+    unsplash_url = "https://api.unsplash.com/photos/random"
+    params = {"query": keywords, "client_id": UNSPLASH_KEY, "orientation": "squarish"}
+    try:
+        img_res = requests.get(unsplash_url, params=params, timeout=10)
+        if img_res.status_code == 200:
+            return img_res.json().get("urls", {}).get("regular")
+    except:
+        pass
+    return "https://images.unsplash.com/photo-1497567149193-57567572f26f"
 
-def post_to_buffer(text, image_url):
-    token = get_env("BUFFER_ACCESS_TOKEN")
-    profile_id = get_env("BUFFER_PROFILE_ID")
-    if not token or not profile_id: raise Exception("Buffer credentials missing")
+# --- MODERN GRAPHQL BUFFER POST (ASSETS VERSION) ---
 
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+def post_to_buffer_graphql(text, image_url):
+    """
+    Uses the modern Buffer GraphQL API configured to publish 
+    immediately via 'shareNow' and 'assets' array.
+    """
+    url = "https://api.buffer.com"
+    headers = {
+        "Authorization": f"Bearer {BUFFER_TOKEN}",
+        "Content-Type": "application/json"
+    }
     
-    # Buffer GraphQL Mutation for immediate posting
-    query = "mutation CreateImmediatePost($input: CreatePostInput!) { createPost(input: $input) { ... on PostActionSuccess { post { id } } } }"
+    query = """
+    mutation CreateImmediatePost($input: CreatePostInput!) {
+      createPost(input: $input) {
+        ... on PostActionSuccess {
+          post {
+            id
+          }
+        }
+        ... on MutationError {
+          message
+        }
+      }
+    }
+    """
+    
+    # 'assets' entries must be OneOf objects, each wrapping the URL
+    # in an explicit asset-type key (image/video/document/link).
+    # Facebook also requires an explicit post type via metadata.
     variables = {
         "input": {
-            "channelId": profile_id, 
-            "text": text, 
+            "channelId": BUFFER_PROFILE_ID,
+            "text": text,
             "schedulingType": "automatic", 
-            "mode": "shareNow", 
-            "assets": [{"externalUrl": image_url}],
-            "metadata": {"facebook": {"type": "post"}}
+            "mode": "shareNow",              
+            "assets": [
+                {
+                    "image": {
+                        "url": image_url
+                    }
+                }
+            ],
+            "metadata": {
+                "facebook": {
+                    "type": "post"
+                }
+            }
         }
     }
     
-    res = requests.post("https://api.buffer.com", json={"query": query, "variables": variables}, headers=headers, timeout=10)
-    if res.status_code != 200:
-        raise Exception(f"Buffer API Error: {res.text}")
-
-# --- ROUTES ---
-
-@app.get("/")
-def home():
-    return {
-        "status": "Bot Active", 
-        "message": "Your quote bot is running. Trigger the post via /cron-post"
+    payload = {
+        "query": query,
+        "variables": variables
     }
+    
+    response = requests.post(url, json=payload, headers=headers)
+    return response.json()
+
+# --- CRON ENDPOINT ---
 
 @app.get("/cron-post")
-def cron(authorization: str = Header(None)):
-    # SECURITY: Only allow requests that match your CRON_SECRET
-    # Vercel Cron Jobs can send this in the Header
-    if authorization != CRON_SECRET:
-        # For local testing, if you didn't set a secret, we allow it.
-        if CRON_SECRET != "my_super_secret_key_123":
-            raise HTTPException(status_code=403, detail="Unauthorized: Secret key mismatch")
-
+async def cron_post():
+    """
+    TRIGGERED BY EXTERNAL CRON.
+    Generates a fresh quote + image and publishes immediately.
+    """
     try:
-        # 1. Get topic from Neon DB
         topic = get_sequential_topic()
+        print(f"Cron triggered! Processing topic: {topic}")
+
+        prompt = f"Write a unique, powerful motivational Facebook quote about {topic}. No hashtags, just 1-2 sentences."
+        caption = model.generate_content(prompt).text.strip()
+
+        keywords = get_image_keywords(caption)
+        image_url = fetch_unsplash_image(keywords)
+
+        result = post_to_buffer_graphql(caption, image_url)
+
+        data = result.get("data", {}).get("createPost", {})
         
-        # 2. Get AI Content and Image
-        caption, img = get_ai_content(topic)
+        if "message" in data:
+            error_msg = data["message"]
+            raise HTTPException(status_code=500, detail=f"Buffer GraphQL Error: {error_msg}")
         
-        # 3. Post to Facebook via Buffer
-        post_to_buffer(caption, img)
-        
-        return {
-            "status": "Success", 
-            "topic": topic, 
-            "caption": caption, 
-            "image": img
-        }
+        if not data.get("post"):
+            top_level_errors = result.get("errors")
+            raise HTTPException(status_code=500, detail=f"API Error: {top_level_errors}")
+
+        print(f"Successfully posted {topic} immediately to Facebook!")
+        return {"status": "success", "topic": topic, "caption": caption, "image": image_url}
+
     except Exception as e:
+        print(f"Cron Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Local Execution block
+# --- MANUAL POST ENDPOINT ---
+
+@app.post("/post")
+async def manual_post(req: PostRequest):
+    """
+    MANUAL POST ENDPOINT — called from the web UI.
+    Takes the caption + image already generated by /generate
+    and publishes them to Facebook via Buffer shareNow.
+    """
+    try:
+        result = post_to_buffer_graphql(req.caption, req.image_url)
+
+        data = result.get("data", {}).get("createPost", {})
+
+        if "message" in data:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Buffer GraphQL Error: {data['message']}"
+            )
+
+        if not data.get("post"):
+            raise HTTPException(
+                status_code=500,
+                detail=f"API Error: {result.get('errors')}"
+            )
+
+        print("Manually posted to Facebook!")
+        return {"status": "success", "post_id": data["post"]["id"]}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Manual Post Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- OTHER ROUTES ---
+
+@app.get("/")
+async def read_index():
+    return FileResponse('static/index.html')
+
+@app.post("/generate")
+async def generate_content(req: PromptRequest):
+    try:
+        prompt = f"Write a short, powerful motivational Facebook quote about {req.topic}. No hashtags, just 1-2 sentences."
+        caption = model.generate_content(prompt).text.strip()
+        keywords = get_image_keywords(caption)
+        image_url = fetch_unsplash_image(keywords)
+        return {"caption": caption, "image_url": image_url}
+    except:
+        return {"caption": "Success is a journey.", "image_url": "https://images.unsplash.com/photo-1497567149193-57567572f26f"}
+
 if __name__ == "__main__":
     import uvicorn
-    print("🚀 Starting local server on http://127.0.0.1:10000")
+    print("Cron-Ready AI Bot (Assets + shareNow Version) Active.")
     uvicorn.run(app, host="0.0.0.0", port=10000)
