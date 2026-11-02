@@ -1,7 +1,6 @@
-    fastapi
-    uvicorn
-    requests
-    google-generativeai
-    psycopg2-binary
-    python-dotenv
-    
+fastapi
+uvicorn
+requests
+google-generativeai
+psycopg2-binary
+python-dotenv
