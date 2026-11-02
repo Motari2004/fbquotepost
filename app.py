@@ -5,9 +5,8 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI
 from dotenv import load_dotenv
-import uvicorn
 
-# Load .env file
+# Load .env file for local development
 load_dotenv()
 
 app = FastAPI()
@@ -21,12 +20,12 @@ def get_db_connection():
     if not url: 
         raise Exception("DATABASE_URL is missing from environment variables")
     
-    # 1. Fix Neon protocol for psycopg2
+    # Fix Neon protocol for psycopg2
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgres://", 1)
     
     try:
-        # 2. MANDATORY for Neon: sslmode='require'
+        # MANDATORY for Neon: sslmode='require'
         return psycopg2.connect(
             url, 
             connect_timeout=10, 
@@ -52,11 +51,9 @@ def get_sequential_topic():
         total = cur.fetchone()['total']
         
         if total == 0:
-            print("🌱 Seeding topics into Neon DB...")
             topics_list = [('resilience',), ('discipline',), ('focus',), ('growth',), ('mindset',), ('consistency',)]
             cur.executemany("INSERT INTO topics (name) VALUES (%s)", topics_list)
             conn.commit()
-            # Refresh total
             cur.execute("SELECT COUNT(*) as total FROM topics")
             total = cur.fetchone()['total']
         
@@ -66,7 +63,6 @@ def get_sequential_topic():
         pointer = res['value'] if res else 0
         
         # Calculate actual topic index
-        # (pointer % total) + 1 because Postgres IDs start at 1
         actual_id = (pointer % total) + 1
         
         cur.execute("SELECT name FROM topics WHERE id = %s", (actual_id,))
@@ -77,7 +73,7 @@ def get_sequential_topic():
             
         topic = topic_row['name']
         
-        # Increment pointer for next run
+        # Increment pointer
         cur.execute("UPDATE bot_state SET value = value + 1 WHERE key = 'pointer'")
         conn.commit()
         
@@ -96,6 +92,7 @@ def get_ai_content(topic):
     if not api_key: raise Exception("GEMINI_API_KEY missing")
     
     genai.configure(api_key=api_key)
+    # Updated to a valid stable model name
     model = genai.GenerativeModel("gemini-3.1-flash-lite")
     
     caption = model.generate_content(f"Powerful short Facebook quote about {topic}. 1 sentence.").text.strip()
@@ -148,6 +145,8 @@ def cron():
     except Exception as e:
         return {"status": "Error", "detail": str(e)}
 
+# Local execution only
 if __name__ == "__main__":
-    print("🚀 Connecting to Neon DB... Starting server on port 10000...")
+    import uvicorn
+    print("🚀 Starting local server on port 10000...")
     uvicorn.run(app, host="0.0.0.0", port=10000)
