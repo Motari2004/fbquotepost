@@ -11,11 +11,33 @@ app = FastAPI()
 def get_env(key):
     return os.getenv(key)
 
+
+
+
+
 def get_db_connection():
     url = get_env("DATABASE_URL")
-    if not url: raise Exception("DATABASE_URL missing")
-    # Important: Neon DBs often need sslmode='require'
-    return psycopg2.connect(url, connect_timeout=10, sslmode='require')
+    if not url: 
+        raise Exception("DATABASE_URL missing")
+    
+    # FIX 1: Force the prefix to be 'postgres://' instead of 'postgresql://'
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgres://", 1)
+    
+    try:
+        # FIX 2: Use sslmode='require' for Neon DB
+        return psycopg2.connect(
+            url, 
+            connect_timeout=10, 
+            sslmode='require'
+        )
+    except Exception as e:
+        # This will give us the ACTUAL error instead of just "0"
+        raise Exception(f"Connection failed: {str(e)}")
+
+
+
+
 
 def get_sequential_topic():
     try:
