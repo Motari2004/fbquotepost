@@ -143,17 +143,26 @@ def post_to_buffer(text, image_url):
 
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    query = (
-        "mutation CreateImmediatePost($input: CreatePostInput!) "
-        "{ createPost(input: $input) { ... on PostActionSuccess { post { id } } } }"
-    )
+    query = """
+    mutation CreatePost($input: CreatePostInput!) {
+      createPost(input: $input) {
+        __typename
+        ... on PostActionSuccess {
+          post { id status }
+        }
+        ... on MutationError {
+          message
+        }
+      }
+    }
+    """
     variables = {
         "input": {
             "channelId": profile_id,
             "text": text,
             "schedulingType": "automatic",
             "mode": "shareNow",
-            "assets": [{"externalUrl": image_url}],
+            "assets": [{"image": {"url": image_url}}],
             "metadata": {"facebook": {"type": "post"}},
         }
     }
@@ -162,10 +171,22 @@ def post_to_buffer(text, image_url):
         "https://api.buffer.com",
         json={"query": query, "variables": variables},
         headers=headers,
-        timeout=10,
+        timeout=15,
     )
     if res.status_code != 200:
         raise Exception(f"Buffer API Error: {res.text}")
+
+    body = res.json()
+
+    # GraphQL returns HTTP 200 even when the request fails, so check the body
+    if body.get("errors"):
+        raise Exception(f"Buffer GraphQL Error: {body['errors']}")
+
+    result = (body.get("data") or {}).get("createPost") or {}
+    if "post" not in result:
+        raise Exception(f"Buffer rejected the post: {result.get('message', body)}")
+
+    return result["post"]
 
 
 # --- ROUTES ---
@@ -187,11 +208,12 @@ def cron():
     try:
         topic = get_sequential_topic()
         caption, img = get_ai_content(topic)
-        post_to_buffer(caption, img)
-        advance_pointer()  # only after a successful post
+        post = post_to_buffer(caption, img)
+        advance_pointer()  # only after Buffer confirms the post
 
         return {
             "status": "Success",
+            "buffer_post": post,
             "topic": topic,
             "caption": caption,
             "image": img,
