@@ -1,9 +1,10 @@
 import os
+import hmac
 import requests
 import google.generativeai as genai
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Query
 from dotenv import load_dotenv
 
 # Load .env file for local development (ignored on Vercel, which uses its own env vars)
@@ -32,6 +33,17 @@ def get_db_connection():
         raise Exception(f"Neon Connection Failed: {str(e)}")
 
 
+def is_authorized(authorization, key):
+    """Accept the secret as 'Authorization: Bearer <secret>' or as ?key=<secret>."""
+    expected = get_env("CRON_SECRET")
+    if not expected:
+        return False
+    supplied = key or ""
+    if authorization and authorization.startswith("Bearer "):
+        supplied = authorization[len("Bearer "):]
+    return hmac.compare_digest(supplied.encode(), expected.encode())
+
+
 # --- DATABASE LOGIC ---
 def get_sequential_topic():
     """Return the current topic WITHOUT advancing the pointer."""
@@ -40,7 +52,6 @@ def get_sequential_topic():
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
 
-        # 1. Create tables and seed data if empty
         cur.execute("CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value INTEGER)")
         cur.execute("CREATE TABLE IF NOT EXISTS topics (id SERIAL PRIMARY KEY, name TEXT UNIQUE)")
         cur.execute("INSERT INTO bot_state (key, value) VALUES ('pointer', 0) ON CONFLICT DO NOTHING")
@@ -57,12 +68,10 @@ def get_sequential_topic():
             cur.execute("SELECT COUNT(*) AS total FROM topics")
             total = cur.fetchone()["total"]
 
-        # 2. Get current pointer
         cur.execute("SELECT value FROM bot_state WHERE key = 'pointer'")
         res = cur.fetchone()
         pointer = res["value"] if res else 0
 
-        # 3. Calculate current topic (looping)
         actual_id = (pointer % total) + 1
         cur.execute("SELECT name FROM topics WHERE id = %s", (actual_id,))
         topic_row = cur.fetchone()
@@ -106,13 +115,11 @@ def get_ai_content(topic):
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(GEMINI_MODEL)
 
-    # Generate quote
     caption_res = model.generate_content(
         f"Write a powerful, short, one-sentence Facebook quote about {topic}. No hashtags."
     )
     caption = caption_res.text.strip()
 
-    # Generate Unsplash keywords
     kw_prompt = (
         f"Provide 3 simple English keywords for a high-quality Unsplash photo "
         f"that matches this quote: '{caption}'. Comma separated only."
@@ -120,7 +127,6 @@ def get_ai_content(topic):
     kw_res = model.generate_content(kw_prompt)
     keywords = kw_res.text.strip()
 
-    # Fetch image
     unsplash_key = get_env("UNSPLASH_ACCESS_KEY")
     img_url = FALLBACK_IMAGE
     if unsplash_key:
@@ -175,7 +181,11 @@ def post_to_buffer(text, image_url):
 
 
 # --- ROUTES ---
+# Each route is registered under two paths so it works whether Vercel
+# passes the original path or the rewritten /api/... path to FastAPI.
 @app.get("/")
+@app.get("/api")
+@app.get("/api/index")
 def home():
     return {
         "status": "Bot Active",
@@ -184,10 +194,9 @@ def home():
 
 
 @app.get("/cron-post")
-def cron(authorization: str = Header(None)):
-    # Vercel Cron sends: Authorization: Bearer <CRON_SECRET>
-    expected = get_env("CRON_SECRET")
-    if not expected or authorization != f"Bearer {expected}":
+@app.get("/api/cron-post")
+def cron(authorization: str = Header(None), key: str = Query(None)):
+    if not is_authorized(authorization, key):
         raise HTTPException(status_code=403, detail="Unauthorized")
 
     try:

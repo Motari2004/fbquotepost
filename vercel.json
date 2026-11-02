@@ -1,5 +1,4 @@
 {
   "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }],
-  "crons": [{ "path": "/cron-post", "schedule": "0 9 * * *" }],
   "functions": { "api/index.py": { "maxDuration": 60 } }
 }
