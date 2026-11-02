@@ -3,41 +3,42 @@ import requests
 import google.generativeai as genai
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from dotenv import load_dotenv
 
-# Load .env file for local development
+# Load .env file for local development (no-op on Vercel)
 load_dotenv()
 
 app = FastAPI()
 
 # --- CONFIGURATION ---
-# To prevent random people from triggering your bot on Vercel,
-# add a 'CRON_SECRET' to your environment variables.
 CRON_SECRET = os.getenv("CRON_SECRET", "my_super_secret_key_123")
+
 
 # --- HELPERS ---
 def get_env(key):
     return os.getenv(key)
 
+
 def get_db_connection():
     url = get_env("DATABASE_URL")
-    if not url: 
+    if not url:
         raise Exception("DATABASE_URL is missing from environment variables")
-    
+
     # Fix Neon protocol for psycopg2 (postgresql:// -> postgres://)
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgres://", 1)
-    
+
     try:
         # MANDATORY for Neon: sslmode='require'
         return psycopg2.connect(
-            url, 
-            connect_timeout=10, 
-            sslmode='require' 
+            url,
+            connect_timeout=10,
+            sslmode='require'
         )
     except Exception as e:
         raise Exception(f"Neon Connection Failed: {str(e)}")
+
 
 # --- DATABASE LOGIC ---
 def get_sequential_topic():
@@ -45,132 +46,150 @@ def get_sequential_topic():
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        
+
         # Create tables if they don't exist
         cur.execute("CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value INTEGER)")
         cur.execute("CREATE TABLE IF NOT EXISTS topics (id SERIAL PRIMARY KEY, name TEXT UNIQUE)")
         cur.execute("INSERT INTO bot_state (key, value) VALUES ('pointer', 0) ON CONFLICT DO NOTHING")
-        
+
         # Seed Topics if empty
         cur.execute("SELECT COUNT(*) as total FROM topics")
         total = cur.fetchone()['total']
-        
+
         if total == 0:
             topics_list = [('resilience',), ('discipline',), ('focus',), ('growth',), ('mindset',), ('consistency',)]
             cur.executemany("INSERT INTO topics (name) VALUES (%s)", topics_list)
             conn.commit()
             cur.execute("SELECT COUNT(*) as total FROM topics")
             total = cur.fetchone()['total']
-        
+
         # Get the current pointer
         cur.execute("SELECT value FROM bot_state WHERE key = 'pointer'")
         res = cur.fetchone()
         pointer = res['value'] if res else 0
-        
+
         # Calculate actual topic index (Postgres IDs start at 1)
         actual_id = (pointer % total) + 1
-        
+
         cur.execute("SELECT name FROM topics WHERE id = %s", (actual_id,))
         topic_row = cur.fetchone()
-        
+
         if not topic_row:
             raise Exception(f"Topic with ID {actual_id} not found in database")
-            
+
         topic = topic_row['name']
-        
+
         # Increment pointer for next run
         cur.execute("UPDATE bot_state SET value = value + 1 WHERE key = 'pointer'")
         conn.commit()
-        
+
         cur.close()
         return topic
-        
+
     except Exception as e:
         raise Exception(f"DB Error: {str(e)}")
     finally:
         if conn:
             conn.close()
 
+
 # --- CONTENT LOGIC ---
 def get_ai_content(topic):
     api_key = get_env("GEMINI_API_KEY")
-    if not api_key: raise Exception("GEMINI_API_KEY missing")
-    
+    if not api_key:
+        raise Exception("GEMINI_API_KEY missing")
+
     genai.configure(api_key=api_key)
-    # Using gemini-1.5-flash for speed and cost-efficiency on Vercel
     model = genai.GenerativeModel("gemini-1.5-flash")
-    
+
     # 1. Generate Quote
-    caption = model.generate_content(f"Powerful short Facebook quote about {topic}. 1 sentence.").text.strip()
-    
+    caption = model.generate_content(
+        f"Powerful short Facebook quote about {topic}. 1 sentence."
+    ).text.strip()
+
     # 2. Generate Keywords for Unsplash
     kw_prompt = f"3 simple English keywords for Unsplash photo for: '{caption}'. Comma separated only."
     keywords = model.generate_content(kw_prompt).text.strip()
-    
+
     # 3. Fetch Image
     unsplash_key = get_env("UNSPLASH_ACCESS_KEY")
-    img_url = "https://images.unsplash.com/photo-1497567149193-57567572f26f" # Fallback
+    img_url = "https://images.unsplash.com/photo-1497567149193-57567572f26f"  # Fallback
     if unsplash_key:
         try:
             res = requests.get(
-                f"https://api.unsplash.com/photos/random?query={keywords}&client_id={unsplash_key}&orientation=squarish", 
+                f"https://api.unsplash.com/photos/random?query={keywords}&client_id={unsplash_key}&orientation=squarish",
                 timeout=10
             )
             img_url = res.json().get("urls", {}).get("regular", img_url)
-        except: pass
-            
+        except Exception:
+            pass
+
     return caption, img_url
+
 
 def post_to_buffer(text, image_url):
     token = get_env("BUFFER_ACCESS_TOKEN")
     profile_id = get_env("BUFFER_PROFILE_ID")
-    if not token or not profile_id: raise Exception("Buffer credentials missing")
+    if not token or not profile_id:
+        raise Exception("Buffer credentials missing")
 
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    query = "mutation CreateImmediatePost($input: CreatePostInput!) { createPost(input: $input) { ... on PostActionSuccess { post { id } } } }"
+    query = (
+        "mutation CreateImmediatePost($input: CreatePostInput!) { "
+        "createPost(input: $input) { ... on PostActionSuccess { post { id } } } }"
+    )
     variables = {
         "input": {
-            "channelId": profile_id, 
-            "text": text, 
-            "schedulingType": "automatic", 
-            "mode": "shareNow", 
+            "channelId": profile_id,
+            "text": text,
+            "schedulingType": "automatic",
+            "mode": "shareNow",
             "assets": [{"externalUrl": image_url}],
             "metadata": {"facebook": {"type": "post"}}
         }
     }
-    res = requests.post("https://api.buffer.com", json={"query": query, "variables": variables}, headers=headers, timeout=10)
+    res = requests.post(
+        "https://api.buffer.com",
+        json={"query": query, "variables": variables},
+        headers=headers,
+        timeout=10
+    )
     if res.status_code != 200:
         raise Exception(f"Buffer API Error: {res.text}")
+
 
 # --- ROUTES ---
 @app.get("/")
 def home():
     return {"status": "Bot Active", "endpoint": "/cron-post"}
 
+
 @app.get("/cron-post")
-def cron(authorization: str = Header(None)):
-    # SECURITY: Check if the request is coming from Vercel Cron or authorized user
-    # In Vercel, you can add a Header in the cron configuration
-    if authorization != CRON_SECRET:
-        # For local testing, we allow it if CRON_SECRET is the default
-        if CRON_SECRET != "my_super_secret_key_123":
-            raise HTTPException(status_code=403, detail="Unauthorized access")
+def cron(request: Request, authorization: str = Header(None)):
+    # Vercel injects "Authorization: Bearer <CRON_SECRET>" for Cron Jobs.
+    # Accept both raw secret (local testing) and Bearer-prefixed (Vercel Cron).
+    expected_bearer = f"Bearer {CRON_SECRET}"
+    is_authorized = authorization in (CRON_SECRET, expected_bearer)
+
+    # If a real CRON_SECRET is configured, enforce auth.
+    if CRON_SECRET != "my_super_secret_key_123" and not is_authorized:
+        raise HTTPException(status_code=403, detail="Unauthorized access")
 
     try:
         topic = get_sequential_topic()
         caption, img = get_ai_content(topic)
         post_to_buffer(caption, img)
         return {
-            "status": "Success", 
-            "topic": topic, 
-            "caption": caption, 
+            "status": "Success",
+            "topic": topic,
+            "caption": caption,
             "image": img
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# IMPORTANT: This block is only for local testing. 
-# Vercel ignores this and uses the 'app' object directly.
+
+# Local testing only. Vercel ignores this and uses the `app` object directly.
 if __name__ == "__main__":
     import uvicorn
     print("🚀 Starting local server on port 10000...")
