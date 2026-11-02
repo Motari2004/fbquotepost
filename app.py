@@ -3,13 +3,18 @@ import requests
 import google.generativeai as genai
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Header
 from dotenv import load_dotenv
 
 # Load .env file for local development
 load_dotenv()
 
 app = FastAPI()
+
+# --- CONFIGURATION ---
+# To prevent random people from triggering your bot on Vercel,
+# add a 'CRON_SECRET' to your environment variables.
+CRON_SECRET = os.getenv("CRON_SECRET", "my_super_secret_key_123")
 
 # --- HELPERS ---
 def get_env(key):
@@ -20,7 +25,7 @@ def get_db_connection():
     if not url: 
         raise Exception("DATABASE_URL is missing from environment variables")
     
-    # Fix Neon protocol for psycopg2
+    # Fix Neon protocol for psycopg2 (postgresql:// -> postgres://)
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgres://", 1)
     
@@ -62,7 +67,7 @@ def get_sequential_topic():
         res = cur.fetchone()
         pointer = res['value'] if res else 0
         
-        # Calculate actual topic index
+        # Calculate actual topic index (Postgres IDs start at 1)
         actual_id = (pointer % total) + 1
         
         cur.execute("SELECT name FROM topics WHERE id = %s", (actual_id,))
@@ -73,7 +78,7 @@ def get_sequential_topic():
             
         topic = topic_row['name']
         
-        # Increment pointer
+        # Increment pointer for next run
         cur.execute("UPDATE bot_state SET value = value + 1 WHERE key = 'pointer'")
         conn.commit()
         
@@ -92,18 +97,25 @@ def get_ai_content(topic):
     if not api_key: raise Exception("GEMINI_API_KEY missing")
     
     genai.configure(api_key=api_key)
-    # Updated to a valid stable model name
-    model = genai.GenerativeModel("gemini-3.1-flash-lite")
+    # Using gemini-1.5-flash for speed and cost-efficiency on Vercel
+    model = genai.GenerativeModel("gemini-1.5-flash")
     
+    # 1. Generate Quote
     caption = model.generate_content(f"Powerful short Facebook quote about {topic}. 1 sentence.").text.strip()
+    
+    # 2. Generate Keywords for Unsplash
     kw_prompt = f"3 simple English keywords for Unsplash photo for: '{caption}'. Comma separated only."
     keywords = model.generate_content(kw_prompt).text.strip()
     
+    # 3. Fetch Image
     unsplash_key = get_env("UNSPLASH_ACCESS_KEY")
-    img_url = "https://images.unsplash.com/photo-1497567149193-57567572f26f"
+    img_url = "https://images.unsplash.com/photo-1497567149193-57567572f26f" # Fallback
     if unsplash_key:
         try:
-            res = requests.get(f"https://api.unsplash.com/photos/random?query={keywords}&client_id={unsplash_key}&orientation=squarish", timeout=10)
+            res = requests.get(
+                f"https://api.unsplash.com/photos/random?query={keywords}&client_id={unsplash_key}&orientation=squarish", 
+                timeout=10
+            )
             img_url = res.json().get("urls", {}).get("regular", img_url)
         except: pass
             
@@ -136,16 +148,29 @@ def home():
     return {"status": "Bot Active", "endpoint": "/cron-post"}
 
 @app.get("/cron-post")
-def cron():
+def cron(authorization: str = Header(None)):
+    # SECURITY: Check if the request is coming from Vercel Cron or authorized user
+    # In Vercel, you can add a Header in the cron configuration
+    if authorization != CRON_SECRET:
+        # For local testing, we allow it if CRON_SECRET is the default
+        if CRON_SECRET != "my_super_secret_key_123":
+            raise HTTPException(status_code=403, detail="Unauthorized access")
+
     try:
         topic = get_sequential_topic()
         caption, img = get_ai_content(topic)
         post_to_buffer(caption, img)
-        return {"status": "Success", "topic": topic, "caption": caption, "image": img}
+        return {
+            "status": "Success", 
+            "topic": topic, 
+            "caption": caption, 
+            "image": img
+        }
     except Exception as e:
-        return {"status": "Error", "detail": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
-# Local execution only
+# IMPORTANT: This block is only for local testing. 
+# Vercel ignores this and uses the 'app' object directly.
 if __name__ == "__main__":
     import uvicorn
     print("🚀 Starting local server on port 10000...")
