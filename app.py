@@ -9,7 +9,8 @@ from dotenv import load_dotenv
 # Load .env file for local development (no-op on Vercel)
 load_dotenv()
 
-app = FastAPI()
+# Disable auto trailing-slash redirects (Vercel's edge proxy mishandles them)
+app = FastAPI(redirect_slashes=False)
 
 # --- CONFIGURATION ---
 CRON_SECRET = os.getenv("CRON_SECRET", "my_super_secret_key_123")
@@ -165,9 +166,10 @@ def home():
 
 
 @app.get("/cron-post")
+@app.get("/cron-post/")
 def cron(request: Request, authorization: str = Header(None)):
-    # Vercel injects "Authorization: Bearer <CRON_SECRET>" for Cron Jobs.
-    # Accept both raw secret (local testing) and Bearer-prefixed (Vercel Cron).
+    # External scheduler should send: Authorization: Bearer <CRON_SECRET>
+    # Also accept raw secret for local/manual testing.
     expected_bearer = f"Bearer {CRON_SECRET}"
     is_authorized = authorization in (CRON_SECRET, expected_bearer)
 
