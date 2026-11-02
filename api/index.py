@@ -1,10 +1,9 @@
 import os
-import hmac
 import requests
 import google.generativeai as genai
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi import FastAPI, HTTPException
 from dotenv import load_dotenv
 
 # Load .env file for local development (ignored on Vercel, which uses its own env vars)
@@ -31,17 +30,6 @@ def get_db_connection():
         return psycopg2.connect(url, connect_timeout=10, sslmode="require")
     except Exception as e:
         raise Exception(f"Neon Connection Failed: {str(e)}")
-
-
-def is_authorized(authorization, key):
-    """Accept the secret as 'Authorization: Bearer <secret>' or as ?key=<secret>."""
-    expected = get_env("CRON_SECRET")
-    if not expected:
-        return False
-    supplied = key or ""
-    if authorization and authorization.startswith("Bearer "):
-        supplied = authorization[len("Bearer "):]
-    return hmac.compare_digest(supplied.encode(), expected.encode())
 
 
 # --- DATABASE LOGIC ---
@@ -195,10 +183,7 @@ def home():
 
 @app.get("/cron-post")
 @app.get("/api/cron-post")
-def cron(authorization: str = Header(None), key: str = Query(None)):
-    if not is_authorized(authorization, key):
-        raise HTTPException(status_code=403, detail="Unauthorized")
-
+def cron():
     try:
         topic = get_sequential_topic()
         caption, img = get_ai_content(topic)
