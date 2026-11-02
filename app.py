@@ -31,7 +31,6 @@ def get_db_connection():
         url = url.replace("postgresql://", "postgres://", 1)
 
     try:
-        # MANDATORY for Neon: sslmode='require'
         return psycopg2.connect(
             url,
             connect_timeout=10,
@@ -48,12 +47,10 @@ def get_sequential_topic():
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
 
-        # Create tables if they don't exist
         cur.execute("CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value INTEGER)")
         cur.execute("CREATE TABLE IF NOT EXISTS topics (id SERIAL PRIMARY KEY, name TEXT UNIQUE)")
         cur.execute("INSERT INTO bot_state (key, value) VALUES ('pointer', 0) ON CONFLICT DO NOTHING")
 
-        # Seed Topics if empty
         cur.execute("SELECT COUNT(*) as total FROM topics")
         total = cur.fetchone()['total']
 
@@ -64,12 +61,10 @@ def get_sequential_topic():
             cur.execute("SELECT COUNT(*) as total FROM topics")
             total = cur.fetchone()['total']
 
-        # Get the current pointer
         cur.execute("SELECT value FROM bot_state WHERE key = 'pointer'")
         res = cur.fetchone()
         pointer = res['value'] if res else 0
 
-        # Calculate actual topic index (Postgres IDs start at 1)
         actual_id = (pointer % total) + 1
 
         cur.execute("SELECT name FROM topics WHERE id = %s", (actual_id,))
@@ -80,7 +75,6 @@ def get_sequential_topic():
 
         topic = topic_row['name']
 
-        # Increment pointer for next run
         cur.execute("UPDATE bot_state SET value = value + 1 WHERE key = 'pointer'")
         conn.commit()
 
@@ -103,18 +97,15 @@ def get_ai_content(topic):
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel("gemini-1.5-flash")
 
-    # 1. Generate Quote
     caption = model.generate_content(
         f"Powerful short Facebook quote about {topic}. 1 sentence."
     ).text.strip()
 
-    # 2. Generate Keywords for Unsplash
     kw_prompt = f"3 simple English keywords for Unsplash photo for: '{caption}'. Comma separated only."
     keywords = model.generate_content(kw_prompt).text.strip()
 
-    # 3. Fetch Image
     unsplash_key = get_env("UNSPLASH_ACCESS_KEY")
-    img_url = "https://images.unsplash.com/photo-1497567149193-57567572f26f"  # Fallback
+    img_url = "https://images.unsplash.com/photo-1497567149193-57567572f26f"
     if unsplash_key:
         try:
             res = requests.get(
@@ -168,12 +159,10 @@ def home():
 @app.get("/cron-post")
 @app.get("/cron-post/")
 def cron(request: Request, authorization: str = Header(None)):
-    # External scheduler should send: Authorization: Bearer <CRON_SECRET>
-    # Also accept raw secret for local/manual testing.
+    # Accept "Bearer <secret>" (external scheduler) or raw secret (manual testing)
     expected_bearer = f"Bearer {CRON_SECRET}"
     is_authorized = authorization in (CRON_SECRET, expected_bearer)
 
-    # If a real CRON_SECRET is configured, enforce auth.
     if CRON_SECRET != "my_super_secret_key_123" and not is_authorized:
         raise HTTPException(status_code=403, detail="Unauthorized access")
 
@@ -191,7 +180,6 @@ def cron(request: Request, authorization: str = Header(None)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Local testing only. Vercel ignores this and uses the `app` object directly.
 if __name__ == "__main__":
     import uvicorn
     print("🚀 Starting local server on port 10000...")
